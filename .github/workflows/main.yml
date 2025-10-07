@@ -1,0 +1,169 @@
+name: Fast Compile kmod-rkp-ipid
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  compile-kmod-rkp-ipid:
+    runs-on: ubuntu-22.04
+    
+    # 使用更大的实例提高编译速度（如果可用）
+    # strategy:
+    #   matrix:
+    #     runner: [larger]
+    
+    steps:
+    # 1. 快速拉取源码（浅克隆）
+    - name: Checkout ImmortalWrt (Shallow)
+      uses: actions/checkout@v4
+      with:
+        repository: immortalwrt/immortalwrt
+        ref: master
+        fetch-depth: 1  # 浅克隆，只获取最新提交
+
+    # 2. 拉取 rkp-ipid 包
+    - name: Checkout kmod-rkp-ipid
+      run: |
+        git clone --depth 1 https://github.com/IOEKKO/rkp-ipid.git package/kmod-rkp-ipid
+        ls -la package/kmod-rkp-ipid/
+
+    # 3. 安装依赖（优化版本）
+    - name: Install Optimized Dependencies
+      run: |
+        sudo apt update -y
+        # 并行安装依赖
+        sudo apt install -y build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+          python3-distutils rsync unzip zlib1g-dev file wget ninja-build \
+          openssl python3-pip libdeflate-tools ccache && \
+        python3 -m pip install -q meson>=0.64 ninja &
+        
+        # 同时设置ccache
+        sudo mkdir -p /usr/local/ccache
+        sudo ln -sf /usr/bin/ccache /usr/local/ccache/gcc
+        sudo ln -sf /usr/bin/ccache /usr/local/ccache/g++
+        wait
+
+    # 4. 配置环境（快速设置）
+    - name: Fast Environment Setup
+      run: |
+        # 启用ccache
+        export CCACHE_DIR="/tmp/ccache"
+        export CCACHE_MAXSIZE="2G"
+        ccache -o compression=true
+        
+        # 创建必要的符号链接
+        mkdir -p staging_dir/host/bin
+        [ -f staging_dir/host/bin/meson ] || ln -sf $(which meson) staging_dir/host/bin/meson
+        [ -f staging_dir/host/bin/ninja ] || ln -sf $(which ninja) staging_dir/host/bin/ninja
+        [ -f staging_dir/host/bin/python3 ] || ln -sf $(which python3) staging_dir/host/bin/python3
+
+    # 5. 极速工具链准备（使用缓存和并行）
+    - name: Ultra-Fast Toolchain Preparation
+      timeout-minutes: 30
+      run: |
+        # 最小化配置，仅包含必要组件
+        cat > .config << 'EOF'
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_filogic=y
+CONFIG_TARGET_mediatek_filogic_DEVICE_generic=y
+CONFIG_TARGET_ARCH="aarch64"
+CONFIG_TARGET_CPU="cortex-a53"
+CONFIG_PACKAGE_kmod-rkp-ipid=y
+CONFIG_PACKAGE_libopenssl=y
+CONFIG_CCACHE=y
+CONFIG_BUILD_LOG=y
+CONFIG_SIGNED_PACKAGES=n
+CONFIG_STRIP_KERNEL_EXPORTS=y
+EOF
+        
+        # 并行编译工具链
+        make defconfig
+        echo "开始并行编译工具链..."
+        make tools/compile -j$(nproc) CC="ccache gcc" V=sc &
+        make toolchain/compile -j$(nproc) CC="ccache gcc" V=sc &
+        wait
+
+    # 6. 快速 feeds 更新
+    - name: Quick Feeds Update
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    # 7. 验证包配置
+    - name: Verify Package Configuration
+      run: |
+        echo "=== 检查 kmod-rkp-ipid 包配置 ==="
+        [ -f "package/kmod-rkp-ipid/Makefile" ] && echo "Makefile 存在" || echo "Makefile 缺失"
+        grep "Package/" package/kmod-rkp-ipid/Makefile || echo "未找到 Package 定义"
+        
+        # 确保配置正确
+        echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
+        make defconfig
+
+    # 8. 极速编译 kmod
+    - name: Ultra-Fast kmod Compilation
+      run: |
+        # 清理并准备
+        make package/kmod-rkp-ipid/clean 2>/dev/null || true
+        
+        # 并行编译依赖，然后编译 kmod
+        echo "开始并行编译 kmod-rkp-ipid..."
+        
+        # 首先编译依赖
+        make package/libopenssl/compile -j$(nproc) V=s &
+        make package/kernel/linux/compile -j$(nproc) V=s &
+        wait
+        
+        # 然后编译目标包
+        time make package/kmod-rkp-ipid/compile -j$(nproc) V=s CC="ccache gcc"
+
+    # 9. 智能 IPK 查找和验证
+    - name: Smart IPK Discovery
+      run: |
+        echo "=== 搜索生成的 IPK 文件 ==="
+        
+        # 搜索所有可能的 IPK 位置
+        IPK_PATHS=(
+          "./bin/packages/aarch64_cortex-a53/base/"
+          "./bin/targets/mediatek/filogic/packages/"
+          "./bin/packages/aarch64_generic/base/"
+          "./bin/"
+        )
+        
+        for path in "${IPK_PATHS[@]}"; do
+          if [ -d "$path" ]; then
+            echo "检查路径: $path"
+            find "$path" -name "*rkp-ipid*.ipk" -type f | head -5
+          fi
+        done
+        
+        # 复制找到的第一个 kmod-rkp-ipid IPK
+        IPK_FILE=$(find ./bin -name "*kmod-rkp-ipid*.ipk" -type f | head -1)
+        if [ -n "$IPK_FILE" ]; then
+          echo "找到 IPK 文件: $IPK_FILE"
+          cp "$IPK_FILE" ./kmod-rkp-ipid.ipk
+          ls -lh kmod-rkp-ipid.ipk
+          echo "文件大小: $(du -h kmod-rkp-ipid.ipk | cut -f1)"
+        else
+          echo "未找到 kmod-rkp-ipid IPK，列出所有 IPK 文件:"
+          find ./bin -name "*.ipk" -type f | head -10
+          echo "编译可能失败，检查日志"
+          exit 1
+        fi
+
+    # 10. 上传产物
+    - name: Upload IPK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kmod-rkp-ipid-package
+        path: ./kmod-rkp-ipid.ipk
+        retention-days: 30
+        compression-level: 0  # 不压缩，加快上传速度
+
+    # 11. 上传编译日志（用于调试）
+    - name: Upload Build Logs
+      if: always()
+      uses: actions/upload-artifact@v4
